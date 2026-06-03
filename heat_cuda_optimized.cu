@@ -1,50 +1,63 @@
 #include "simulation.cuh"
-
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "physics.cuh"
+
+#define BLOCK_X 32
+#define BLOCK_Y 8
+
 __constant__ float c_weights[WEIGHTS_COUNT];
+
 __global__ void optimized_heat_step_kernel(
-    const float *current,
-    float *next,
+    const float *__restrict__ current,
+    float *__restrict__ next,
     int width,
     int height,
-    int timestep,
     float sx,
     float sy)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    __shared__ float s_tile[BLOCK_Y + 2 * STENCIL_RADIUS][BLOCK_X + 2 * STENCIL_RADIUS];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int x = blockIdx.x * blockDim.x + tx;
+    int y = blockIdx.y * blockDim.y + ty;
+
+    for (int i = ty; i < BLOCK_Y + 2 * STENCIL_RADIUS; i += blockDim.y)
+    {
+        for (int j = tx; j < BLOCK_X + 2 * STENCIL_RADIUS; j += blockDim.x)
+        {
+            int global_x = blockIdx.x * blockDim.x + j - STENCIL_RADIUS;
+            int global_y = blockIdx.y * blockDim.y + i - STENCIL_RADIUS;
+
+            s_tile[i][j] = sample_clamped(current, width, height, global_x, global_y);
+        }
+    }
+
+    __syncthreads();
 
     if (x >= width || y >= height)
         return;
 
-   // float source = heat_source(timestep, x, y, width, height);
     float dxs = (float)x - sx;
     float dys = (float)y - sy;
+    float dist_sq = dxs * dxs + dys * dys;
 
-    float dist_sq = dxs*dxs + dys*dys;
+    float source = (dist_sq <= SOURCE_RADIUS * SOURCE_RADIUS) ? SOURCE_HEAT : 0.0f;
 
-    float source =
-        (dist_sq <= SOURCE_RADIUS*SOURCE_RADIUS)
-        ? SOURCE_HEAT
-        : 0.0f;
-    #pragma unroll
-    for (int dy = -STENCIL_RADIUS; dy <= STENCIL_RADIUS; dy++) {
-        #pragma unroll
-        for (int dx = -STENCIL_RADIUS; dx <= STENCIL_RADIUS; dx++) {
+#pragma unroll
+    for (int dy = -STENCIL_RADIUS; dy <= STENCIL_RADIUS; dy++)
+    {
+#pragma unroll
+        for (int dx = -STENCIL_RADIUS; dx <= STENCIL_RADIUS; dx++)
+        {
+            float val = s_tile[ty + STENCIL_RADIUS + dy][tx + STENCIL_RADIUS + dx];
+            float weight = c_weights[(dy + STENCIL_RADIUS) * STENCIL_SIZE + (dx + STENCIL_RADIUS)];
 
-            source += sample_clamped(
-                          current,
-                          width,
-                          height,
-                          x + dx,
-                          y + dy)
-                    * c_weights[(dy + STENCIL_RADIUS) * STENCIL_SIZE +
-                                (dx + STENCIL_RADIUS)];
+            source += val * weight;
         }
     }
 
@@ -84,32 +97,50 @@ void heat_simulate_optimized(
     int start_step,
     int num_steps)
 {
-    float *d_current = NULL;
-    float *d_next = NULL;
     size_t grid_bytes = (size_t)width * (size_t)height * sizeof(float);
 
-    for (int s = 0; s < num_simulations; s++) {
-        CUDA_CHECK(cudaMalloc(&d_current, grid_bytes));
-        CUDA_CHECK(cudaMalloc(&d_next, grid_bytes));
-        CUDA_CHECK(cudaMemcpy(d_current, initial_states[s], grid_bytes, cudaMemcpyHostToDevice));
+    float **d_current = (float **)malloc(num_simulations * sizeof(float *));
+    float **d_next = (float **)malloc(num_simulations * sizeof(float *));
+    cudaStream_t *streams = (cudaStream_t *)malloc(num_simulations * sizeof(cudaStream_t));
 
-        dim3 block(32,8);
-        dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    dim3 block(BLOCK_X, BLOCK_Y);
+    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
 
-        for (int step = start_step; step < start_step + num_steps; step++) {
+    for (int s = 0; s < num_simulations; s++)
+    {
+        CUDA_CHECK(cudaStreamCreate(&streams[s]));
+        CUDA_CHECK(cudaMalloc(&d_current[s], grid_bytes));
+        CUDA_CHECK(cudaMalloc(&d_next[s], grid_bytes));
+
+        CUDA_CHECK(cudaMemcpyAsync(d_current[s], initial_states[s], grid_bytes, cudaMemcpyHostToDevice, streams[s]));
+    }
+
+    for (int s = 0; s < num_simulations; s++)
+    {
+        for (int step = start_step; step < start_step + num_steps; step++)
+        {
             float sx, sy;
             source_position(step, width, height, &sx, &sy);
-            optimized_heat_step_kernel<<<grid, block>>>(
-                d_current, d_next, width, height, step, sx, sy);
-            CUDA_CHECK(cudaGetLastError());
-            swap_buffers(&d_current, &d_next);
+
+            optimized_heat_step_kernel<<<grid, block, 0, streams[s]>>>(
+                d_current[s], d_next[s], width, height, sx, sy);
+
+            swap_buffers(&d_current[s], &d_next[s]);
         }
 
-        CUDA_CHECK(cudaMemcpy(final_states[s], d_current, grid_bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        CUDA_CHECK(cudaFree(d_current));
-        CUDA_CHECK(cudaFree(d_next));
+        CUDA_CHECK(cudaMemcpyAsync(final_states[s], d_current[s], grid_bytes, cudaMemcpyDeviceToHost, streams[s]));
     }
-}
 
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    for (int s = 0; s < num_simulations; s++)
+    {
+        CUDA_CHECK(cudaFree(d_current[s]));
+        CUDA_CHECK(cudaFree(d_next[s]));
+        CUDA_CHECK(cudaStreamDestroy(streams[s]));
+    }
+
+    free(d_current);
+    free(d_next);
+    free(streams);
+}
