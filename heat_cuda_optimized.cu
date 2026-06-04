@@ -115,20 +115,34 @@ void heat_simulate_optimized(
         CUDA_CHECK(cudaMemcpyAsync(d_current[s], initial_states[s], grid_bytes, cudaMemcpyHostToDevice, streams[s]));
     }
 
-    for (int s = 0; s < num_simulations; s++)
+    for (int step = start_step; step < start_step + num_steps; step++)
     {
-        for (int step = start_step; step < start_step + num_steps; step++)
-        {
-            float sx, sy;
-            source_position(step, width, height, &sx, &sy);
+        float sx, sy;
+        source_position(step, width, height, &sx, &sy);
 
+        for (int s = 0; s < num_simulations; s++)
+        {
             optimized_heat_step_kernel<<<grid, block, 0, streams[s]>>>(
-                d_current[s], d_next[s], width, height, sx, sy);
+                d_current[s],
+                d_next[s],
+                width,
+                height,
+                sx,
+                sy);
 
             swap_buffers(&d_current[s], &d_next[s]);
         }
+    }
 
-        CUDA_CHECK(cudaMemcpyAsync(final_states[s], d_current[s], grid_bytes, cudaMemcpyDeviceToHost, streams[s]));
+    //  CUDA_CHECK(cudaMemcpyAsync(final_states[s], d_current[s], grid_bytes, cudaMemcpyDeviceToHost, streams[s]));
+    for (int s = 0; s < num_simulations; s++)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(
+            final_states[s],
+            d_current[s],
+            grid_bytes,
+            cudaMemcpyDeviceToHost,
+            streams[s]));
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
