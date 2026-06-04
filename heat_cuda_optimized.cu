@@ -7,8 +7,12 @@
 
 #include "physics.cuh"
 
+/*
+ * 32 in X keeps memory accesses coalesced.
+ * 16 in Y reduces the number of blocks and halo overhead compared to 32x8.
+ */
 #define BLOCK_X 32
-#define BLOCK_Y 8
+#define BLOCK_Y 16
 
 __constant__ float c_weights[WEIGHTS_COUNT];
 
@@ -25,6 +29,11 @@ __global__ void optimized_heat_step_kernel(
     int height,
     int timestep)
 {
+    /*
+     * Shared-memory tile:
+     * BLOCK area + halo on all sides.
+     * The +1 in the X dimension helps reduce shared-memory bank conflicts.
+     */
     __shared__ float s_tile
         [BLOCK_Y + 2 * STENCIL_RADIUS]
         [BLOCK_X + 2 * STENCIL_RADIUS + 1];
@@ -39,8 +48,12 @@ __global__ void optimized_heat_step_kernel(
     const int y = block_origin_y + ty;
 
     /*
-     * Interior block: the whole tile including halo is inside the grid.
-     * Then sample_clamped is equivalent to direct global-memory load.
+     * Most blocks are interior blocks.
+     * For them, the entire tile including halo is inside the grid,
+     * so direct global-memory loads are equivalent to sample_clamped.
+     *
+     * Boundary blocks still use sample_clamped exactly like the reference,
+     * preserving correctness.
      */
     const bool interior_block =
         block_origin_x >= STENCIL_RADIUS &&
@@ -50,8 +63,7 @@ __global__ void optimized_heat_step_kernel(
 
     /*
      * Load tile + halo into shared memory.
-     * For interior blocks: direct load.
-     * For boundary blocks: use the exact same sample_clamped as reference.
+     * Threads cooperatively load more elements than output cells because of halo.
      */
     for (int local_y = ty;
          local_y < BLOCK_Y + 2 * STENCIL_RADIUS;
@@ -78,6 +90,10 @@ __global__ void optimized_heat_step_kernel(
         }
     }
 
+    /*
+     * Required because all threads must finish loading the shared tile
+     * before any thread starts reading stencil neighbors from it.
+     */
     __syncthreads();
 
     if (x >= width || y >= height)
@@ -86,8 +102,8 @@ __global__ void optimized_heat_step_kernel(
     }
 
     /*
-     * Use the exact same heat_source as the reference.
-     * This avoids tiny differences in source_position / radius logic.
+     * Keep the exact reference heat source for correctness.
+     * This avoids numerical differences from manually reimplementing it.
      */
     float source = heat_source(timestep, x, y, width, height);
 
@@ -188,10 +204,16 @@ void heat_simulate_optimized(
         (size_t)width * (size_t)height * sizeof(float);
 
     dim3 block(BLOCK_X, BLOCK_Y);
+
     dim3 grid(
         (width + BLOCK_X - 1) / BLOCK_X,
         (height + BLOCK_Y - 1) / BLOCK_Y);
 
+    /*
+     * Copy all simulations to the GPU.
+     * We keep streams because they were explicitly covered in the CUDA material
+     * and the previous version already used them correctly.
+     */
     for (int s = 0; s < num_simulations; s++)
     {
         CUDA_CHECK(cudaMemcpyAsync(
