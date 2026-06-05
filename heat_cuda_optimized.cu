@@ -3,136 +3,104 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "physics.cuh"
 
-/*
- * 32 in X keeps memory accesses coalesced.
- * 16 in Y reduces the number of blocks and halo overhead compared to 32x8.
- */
 #define BLOCK_X 32
 #define BLOCK_Y 16
+#define ROWS_PER_THREAD 2
+#define OUT_Y (BLOCK_Y * ROWS_PER_THREAD)
 
 __constant__ float c_weights[WEIGHTS_COUNT];
 
-static float **g_d_current = NULL;
-static float **g_d_next = NULL;
-static cudaStream_t *g_streams = NULL;
-static int g_num_simulations = 0;
-static size_t g_grid_bytes = 0;
+static float *d_current = NULL;
+static float *d_next = NULL;
+static int sim_size = 0;
 
 __global__ void optimized_heat_step_kernel(
-    const float *__restrict__ current,
-    float *__restrict__ next,
+    const float *current,
+    float *next,
     int width,
     int height,
-    int timestep)
+    int timestep,
+    int sim_size)
 {
-    /*
-     * Shared-memory tile:
-     * BLOCK area + halo on all sides.
-     * The +1 in the X dimension helps reduce shared-memory bank conflicts.
-     */
-    __shared__ float s_tile
-        [BLOCK_Y + 2 * STENCIL_RADIUS]
-        [BLOCK_X + 2 * STENCIL_RADIUS + 1];
+    __shared__ float tile[OUT_Y + 2 * STENCIL_RADIUS][BLOCK_X + 2 * STENCIL_RADIUS];
+    __shared__ float source_x;
+    __shared__ float source_y;
 
-    const int tx = threadIdx.x;
-    const int ty = threadIdx.y;
+    const float *cur = current + blockIdx.z * sim_size;
+    float *nxt = next + blockIdx.z * sim_size;
 
-    const int block_origin_x = blockIdx.x * BLOCK_X;
-    const int block_origin_y = blockIdx.y * BLOCK_Y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
-    const int x = block_origin_x + tx;
-    const int y = block_origin_y + ty;
+    int origin_x = blockIdx.x * BLOCK_X;
+    int origin_y = blockIdx.y * OUT_Y;
 
-    /*
-     * Most blocks are interior blocks.
-     * For them, the entire tile including halo is inside the grid,
-     * so direct global-memory loads are equivalent to sample_clamped.
-     *
-     * Boundary blocks still use sample_clamped exactly like the reference,
-     * preserving correctness.
-     */
-    const bool interior_block =
-        block_origin_x >= STENCIL_RADIUS &&
-        block_origin_y >= STENCIL_RADIUS &&
-        block_origin_x + BLOCK_X + STENCIL_RADIUS <= width &&
-        block_origin_y + BLOCK_Y + STENCIL_RADIUS <= height;
+    int x = origin_x + tx;
+    int row0 = ty * ROWS_PER_THREAD;
+    int y0 = origin_y + row0;
+    int y1 = y0 + 1;
 
-    /*
-     * Load tile + halo into shared memory.
-     * Threads cooperatively load more elements than output cells because of halo.
-     */
-    for (int local_y = ty;
-         local_y < BLOCK_Y + 2 * STENCIL_RADIUS;
-         local_y += BLOCK_Y)
+    bool inside = origin_x >= STENCIL_RADIUS &&
+                  origin_y >= STENCIL_RADIUS &&
+                  origin_x + BLOCK_X + STENCIL_RADIUS <= width &&
+                  origin_y + OUT_Y + STENCIL_RADIUS <= height;
+
+    for (int ly = ty; ly < OUT_Y + 2 * STENCIL_RADIUS; ly += BLOCK_Y)
     {
-        const int gy = block_origin_y + local_y - STENCIL_RADIUS;
-
-        for (int local_x = tx;
-             local_x < BLOCK_X + 2 * STENCIL_RADIUS;
-             local_x += BLOCK_X)
+        for (int lx = tx; lx < BLOCK_X + 2 * STENCIL_RADIUS; lx += BLOCK_X)
         {
-            const int gx = block_origin_x + local_x - STENCIL_RADIUS;
-
-            if (interior_block)
+            int gx = origin_x + lx - STENCIL_RADIUS;
+            int gy = origin_y + ly - STENCIL_RADIUS;
+            if (inside)
             {
-                s_tile[local_y][local_x] =
-                    current[gy * width + gx];
+                tile[ly][lx] = cur[gy * width + gx];
             }
             else
             {
-                s_tile[local_y][local_x] =
-                    sample_clamped(current, width, height, gx, gy);
+                tile[ly][lx] = sample_clamped(cur, width, height, gx, gy);
             }
         }
     }
 
-    /*
-     * Required because all threads must finish loading the shared tile
-     * before any thread starts reading stencil neighbors from it.
-     */
-    __syncthreads();
-
-    if (x >= width || y >= height)
+    if (tx == 0 && ty == 0)
     {
-        return;
+        source_position(timestep, width, height, &source_x, &source_y);
     }
 
-    /*
-     * Keep the exact reference heat source for correctness.
-     * This avoids numerical differences from manually reimplementing it.
-     */
-    float source = heat_source(timestep, x, y, width, height);
+    __syncthreads();
 
-#pragma unroll
+    float fx = (float)x - source_x;
+    float fy0 = (float)y0 - source_y;
+    float fy1 = (float)y1 - source_y;
+
+    float r0 = (fx * fx + fy0 * fy0 <= SOURCE_RADIUS * SOURCE_RADIUS) ? SOURCE_HEAT : 0.0f;
+    float r1 = (fx * fx + fy1 * fy1 <= SOURCE_RADIUS * SOURCE_RADIUS) ? SOURCE_HEAT : 0.0f;
+
     for (int dy = -STENCIL_RADIUS; dy <= STENCIL_RADIUS; dy++)
     {
-#pragma unroll
         for (int dx = -STENCIL_RADIUS; dx <= STENCIL_RADIUS; dx++)
         {
-            const float val =
-                s_tile[ty + STENCIL_RADIUS + dy]
-                      [tx + STENCIL_RADIUS + dx];
-
-            const float weight =
-                c_weights[(dy + STENCIL_RADIUS) * STENCIL_SIZE
-                        + (dx + STENCIL_RADIUS)];
-
-            source += val * weight;
+            float w = c_weights[(dy + STENCIL_RADIUS) * STENCIL_SIZE + (dx + STENCIL_RADIUS)];
+            int col = tx + STENCIL_RADIUS + dx;
+            r0 += tile[row0 + STENCIL_RADIUS + dy][col] * w;
+            r1 += tile[row0 + 1 + STENCIL_RADIUS + dy][col] * w;
         }
     }
 
-    next[y * width + x] = source;
-}
-
-static void swap_buffers(float **a, float **b)
-{
-    float *tmp = *a;
-    *a = *b;
-    *b = tmp;
+    if (x < width)
+    {
+        if (y0 < height)
+        {
+            nxt[y0 * width + x] = r0;
+        }
+        if (y1 < height)
+        {
+            nxt[y1 * width + x] = r1;
+        }
+    }
 }
 
 void heat_simulate_optimized_init(
@@ -141,53 +109,20 @@ void heat_simulate_optimized_init(
     int num_simulations,
     const float *weights)
 {
-    CUDA_CHECK(cudaMemcpyToSymbol(
-        c_weights,
-        weights,
-        WEIGHTS_COUNT * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_weights, weights, WEIGHTS_COUNT * sizeof(float)));
 
-    g_num_simulations = num_simulations;
-    g_grid_bytes = (size_t)width * (size_t)height * sizeof(float);
+    sim_size = width * height;
 
-    g_d_current = (float **)malloc(num_simulations * sizeof(float *));
-    g_d_next = (float **)malloc(num_simulations * sizeof(float *));
-    g_streams = (cudaStream_t *)malloc(num_simulations * sizeof(cudaStream_t));
-
-    if (g_d_current == NULL || g_d_next == NULL || g_streams == NULL)
-    {
-        fprintf(stderr, "Host malloc failed in heat_simulate_optimized_init\n");
-        exit(1);
-    }
-
-    for (int s = 0; s < num_simulations; s++)
-    {
-        CUDA_CHECK(cudaStreamCreate(&g_streams[s]));
-        CUDA_CHECK(cudaMalloc(&g_d_current[s], g_grid_bytes));
-        CUDA_CHECK(cudaMalloc(&g_d_next[s], g_grid_bytes));
-    }
+    CUDA_CHECK(cudaMalloc(&d_current, (size_t)num_simulations * sim_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_next, (size_t)num_simulations * sim_size * sizeof(float)));
 }
 
 void heat_simulate_optimized_finalize(void)
 {
-    if (g_d_current != NULL && g_d_next != NULL && g_streams != NULL)
-    {
-        for (int s = 0; s < g_num_simulations; s++)
-        {
-            CUDA_CHECK(cudaFree(g_d_current[s]));
-            CUDA_CHECK(cudaFree(g_d_next[s]));
-            CUDA_CHECK(cudaStreamDestroy(g_streams[s]));
-        }
-    }
-
-    free(g_d_current);
-    free(g_d_next);
-    free(g_streams);
-
-    g_d_current = NULL;
-    g_d_next = NULL;
-    g_streams = NULL;
-    g_num_simulations = 0;
-    g_grid_bytes = 0;
+    cudaFree(d_current);
+    cudaFree(d_next);
+    d_current = NULL;
+    d_next = NULL;
 }
 
 void heat_simulate_optimized(
@@ -200,57 +135,32 @@ void heat_simulate_optimized(
     int start_step,
     int num_steps)
 {
-    const size_t grid_bytes =
-        (size_t)width * (size_t)height * sizeof(float);
+    int bytes = sim_size * sizeof(float);
 
-    dim3 block(BLOCK_X, BLOCK_Y);
-
-    dim3 grid(
-        (width + BLOCK_X - 1) / BLOCK_X,
-        (height + BLOCK_Y - 1) / BLOCK_Y);
-
-    /*
-     * Copy all simulations to the GPU.
-     * We keep streams because they were explicitly covered in the CUDA material
-     * and the previous version already used them correctly.
-     */
     for (int s = 0; s < num_simulations; s++)
     {
-        CUDA_CHECK(cudaMemcpyAsync(
-            g_d_current[s],
-            initial_states[s],
-            grid_bytes,
-            cudaMemcpyHostToDevice,
-            g_streams[s]));
+        CUDA_CHECK(cudaMemcpy(d_current + s * sim_size, initial_states[s], bytes, cudaMemcpyHostToDevice));
     }
 
-    for (int step = start_step;
-         step < start_step + num_steps;
-         step++)
-    {
-        for (int s = 0; s < num_simulations; s++)
-        {
-            optimized_heat_step_kernel<<<grid, block, 0, g_streams[s]>>>(
-                g_d_current[s],
-                g_d_next[s],
-                width,
-                height,
-                step);
+    dim3 block(BLOCK_X, BLOCK_Y);
+    dim3 grid((width + BLOCK_X - 1) / BLOCK_X,
+              (height + OUT_Y - 1) / OUT_Y,
+              num_simulations);
 
-            swap_buffers(&g_d_current[s], &g_d_next[s]);
-        }
+    for (int step = start_step; step < start_step + num_steps; step++)
+    {
+        optimized_heat_step_kernel<<<grid, block>>>(d_current, d_next, width, height, step, sim_size);
+
+        float *tmp = d_current;
+        d_current = d_next;
+        d_next = tmp;
     }
 
     CUDA_CHECK(cudaGetLastError());
 
     for (int s = 0; s < num_simulations; s++)
     {
-        CUDA_CHECK(cudaMemcpyAsync(
-            final_states[s],
-            g_d_current[s],
-            grid_bytes,
-            cudaMemcpyDeviceToHost,
-            g_streams[s]));
+        CUDA_CHECK(cudaMemcpy(final_states[s], d_current + s * sim_size, bytes, cudaMemcpyDeviceToHost));
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
