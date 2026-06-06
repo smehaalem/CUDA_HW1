@@ -75,7 +75,7 @@ Things we tried that didn't help: we also tested 4 pixels per thread, but it was
 
 In the end we got PASS, around 5 ms vs about 41 ms for the reference (it moves a bit depending on how busy the server is).
 
-Reference we used: https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/
+We didn't use any outside sources - all the ideas (shared memory, constant memory, 3D grid / blockIdx.z) came from the course lectures and the CUDA tutorial.
 
 ---
 
