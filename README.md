@@ -59,25 +59,23 @@ Write your answer under the **A1.** label. A short but concrete write-up is enou
 
 **A1.**
 
-We improved the reference kernel gradually, checking PASS and the time after each change.
+We started from the reference kernel and improved it in small steps, running the benchmark after each change to make sure it still printed PASS.
 
-- **Shared memory.** Each cell in the 13x13 stencil is accessed by many neighbors, so the reference reads them all from global memory. We loaded a tile of the grid plus a halo into shared memory once per block and ran the stencil from there, using __syncthreads() after loading. This is essentially the 2D version of the stencil example from the tutorial. It was a significant improvement.
+The first thing was shared memory. In the reference every cell reads all 169 neighbors straight from global memory, and neighbor cells read mostly the same values, so the same data gets read over and over. So each block loads its part of the grid plus a halo into shared memory once, does __syncthreads(), and then runs the stencil from shared memory. This is basically the 2D version of the stencil example from the tutorial, and it helped a lot.
 
-- **Constant memory.** The weights are read-only and every thread uses the same values, so we moved them to constant memory. When all threads in a warp access the same weight, it is broadcast in a single access, which worked well for us.
+We also put the weight matrix in constant memory, since it never changes and all threads use the same values. When the whole warp reads the same weight it gets broadcast, so it's almost free.
 
-- **One launch for all simulations (biggest win).** Initially, we launched one kernel per simulation, which totaled 300 steps times 10 simulations, making 3000 launches. Since the grid is only 128x128, each kernel is small, and the time was mostly lost in launch overhead rather than actual work. We combined all 10 simulations into one buffer and utilized the z dimension of the grid (blockIdx.z) so one launch would advance all simulations together. This reduced the launches to only 300 and roughly halved the time.
+The biggest win was how we launch the kernel. At first we launched one kernel per simulation, which is 300 steps * 10 sims = 3000 launches. The grid is only 128x128 so each kernel does almost no work, and most of the time was just launch overhead. We put all 10 simulations in one buffer and used the z dimension of the grid (blockIdx.z) so one launch advances all of them at once. That dropped it to 300 launches and roughly cut the time in half.
 
-- **Source once per block.** heat_source uses cosf/sinf through source_position, but the source position only depends on the timestep, not x or y. As a result, every thread was recomputing the same value. We let one thread calculate it and store it in shared memory for the rest of the block to reuse.
+A smaller one: the source position uses cos/sin but only depends on the timestep, not on x/y, so every thread was computing the same thing. We let one thread compute it into shared memory and the rest of the block reuse it.
 
-- **Two pixels per thread.** After the above changes, the slowest part was the shared-memory reads in the stencil loop, which were 169 per cell. We made each thread compute two stacked pixels using the same loaded tile, allowing those reads to be shared between the two pixels. We maintained the same dy/dx loop order as the reference to keep the values consistent. This adjustment helped us go under 5 ms.
+Last, once the slow part was the shared-memory reads in the stencil loop (169 per cell), we made each thread compute two pixels stacked on top of each other instead of one. Both use the same loaded tile, so the reads are shared between them. We kept the same dy/dx loop order as the reference so the result stays exactly the same.
 
-What didn’t really help:
-- We also tried four pixels per thread with fewer threads per block. This approach actually slowed down performance. With fewer threads, the GPU had less work to overlap, meaning the loss of parallelism outweighed the benefits of extra reuse. So we decided to stick with two pixels per thread.
-- The interior-block fast path, which skips the boundary clamp for blocks fully inside the grid, made almost no difference once the kernel was limited by the stencil reads rather than the load. We kept it since it did not negatively impact performance.
+Things we tried that didn't help: we also tested 4 pixels per thread, but it was slower - with fewer threads the GPU has less to overlap, so we went back to 2. The interior-block fast path (skipping the boundary check for blocks fully inside the grid) also didn't really change anything, we just left it in.
 
-Final results on the lambda RTX 2080 Ti: PASS, about 4.7 ms compared to around 41 ms for the reference.
+In the end we got PASS, around 5 ms vs about 41 ms for the reference (it moves a bit depending on how busy the server is).
 
-Reference we looked at: https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/
+Reference we used: https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/
 
 ---
 
